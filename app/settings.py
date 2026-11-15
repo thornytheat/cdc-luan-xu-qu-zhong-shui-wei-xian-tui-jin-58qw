@@ -10,6 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SAMPLE_DIR = BASE_DIR / "sample_data"
 EVENTS_DIR = SAMPLE_DIR / "events"
 SCHEMAS_DIR = SAMPLE_DIR / "schemas"
+SEGMENTS_DIR = SAMPLE_DIR / "segments"
 DATA_DIR = Path(os.environ.get("CDCWATER_DATA_DIR", str(BASE_DIR / "data")))
 SEED_VERSION = "seed-2026-11-10.1"
 
@@ -55,6 +56,21 @@ VERDICT_LABELS = {
     "compatible_with_backfill": "放行+回填",
     "blocked": "阻断",
 }
+
+# 分段补传：段状态 → 页面展示文案
+SEGMENT_STATUS_LABELS = {
+    "committed": "已确认",
+    "quarantined": "隔离待补",
+    "failed": "失败停住",
+}
+
+# 补传与发布页的演示顺序提示（与 sample_data/generate_segments.py 的埋点一致）
+SEGMENT_DEMO_HINTS = [
+    "顺序补传：orders 依次点 seg1 → seg2 → seg3，看「已确认段」连续推进；seg1 确认后水位线仍停在 2026-11-10T00:14:00Z（O1009 未动）。",
+    "乱序补传：换 customers 先点 seg1，再点 seg3 —— seg3 进「隔离待补」、缺口出现 [2]，水位线不动；再点 seg2，缺口补齐，seg2/seg3 级联确认，水位线跳到 2026-11-11T09:01:00Z。",
+    "坏事件：inventory 点 seg4（坏）—— 第 3 行 op 非法，整段停住记为失败；再点 seg4（修复版）重传即确认。",
+    "原子发布：三表段补齐后，选 v1 点「校验并发布」一次切换现网并导出；再点一次内容未变化，发布次数不推进；改选 v2 发布，门禁阻断、保留旧版。",
+]
 
 CHANGE_LABELS = {
     "removed_column": "删除列",

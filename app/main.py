@@ -1,19 +1,23 @@
 """FastAPI 路由（薄）：页面渲染 + JSON 端点，业务全部在领域模块里。
 
-页面：/ 首页 · /workbench 工作台 · /result/{run_id} 结果 · /review 复核与导出
+页面：/ 首页 · /workbench 工作台 · /result/{run_id} 结果 · /review 复核 · /segments 补传与发布
 接口：POST /api/merge · GET /api/runs · GET /api/runs/{id} · GET /api/runs/{id}/snapshot
+      POST /api/segments · GET /api/segments · POST /api/segments/reset · GET /api/segments/samples
+      POST /api/publish · GET /api/publishes · GET /api/publishes/{no}/export
 """
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import archive, runner, schema_gate, settings, snapshot, store
+from . import archive, publish, runner, schema_gate, segments, settings, snapshot, store
 from .archive import EventError
 
 BASE_DIR = settings.BASE_DIR
@@ -39,6 +43,18 @@ class MergeRequest(BaseModel):
     schema_version: int = Field(2, ge=1, le=2, description="要评估的目标 schema 版本")
 
 
+class SegmentUpload(BaseModel):
+    source: str = Field(description="来源（表 名）")
+    segment_no: int = Field(ge=1, description="段号（按来源从 1 连续递增）")
+    events: list[dict] | None = Field(default=None, description="段内事件（JSON 对象列表）")
+    events_jsonl: str | None = Field(default=None, description="段内事件（JSONL 文本，二选一）")
+
+
+class PublishRequest(BaseModel):
+    tables: list[str] = Field(default_factory=list, description="要校验并切换的表名")
+    schema_version: int = Field(1, ge=1, le=2, description="目标 schema 版本")
+
+
 def render(request: Request, template: str, **ctx) -> HTMLResponse:
     context = {
         "app_name": settings.APP_NAME,
@@ -60,6 +76,12 @@ def with_conn():
     return conn
 
 
+def back_to_segments(notice: str = "", error: str = "") -> RedirectResponse:
+    """表单提交后 303 回补传页，带一行提示（看板与发布状态由页面重新渲染）。"""
+    query = urlencode({k: v for k, v in (("notice", notice), ("error", error)) if v})
+    return RedirectResponse(f"/segments{'?' + query if query else ''}", status_code=303)
+
+
 # --- 页面 ------------------------------------------------------------------
 
 
@@ -67,12 +89,16 @@ def with_conn():
 def health():
     conn = with_conn()
     try:
+        current = store.current_publish(conn)
         return {
             "status": "ok",
             "app": settings.APP_SHORT,
             "events": store.total_events(conn),
             "runs": store.run_count(conn),
             "seed_version": store.get_meta(conn, "seed_version"),
+            "quarantined_segments": len(store.list_segments(conn, status=store.SEGMENT_QUARANTINED)),
+            "failed_segments": len(store.list_segments(conn, status=store.SEGMENT_FAILED)),
+            "publish_no": current["publish_no"] if current else 0,
         }
     finally:
         conn.close()
@@ -225,6 +251,117 @@ def review(request: Request, run_id: str | None = None, kind: str = Query(defaul
     )
 
 
+@app.get("/segments", response_class=HTMLResponse)
+def segments_page(request: Request, notice: str = "", error: str = ""):
+    conn = with_conn()
+    try:
+        board = segments.board(conn)
+        pub = publish.status(conn)
+        events_by_table = {table: store.fetch_events(conn, table) for table in settings.TABLE_NAMES}
+    finally:
+        conn.close()
+    # 实时演算当前归档水位线（只读、不落库）：隔离段未归档，因此推不动这条线
+    base_doc, _ = runner.load_schemas(1)
+    live = runner.analyze(settings.TABLE_NAMES, events_by_table, base_doc, base_doc)
+    live_wm = {
+        "watermark": live["watermark"]["watermark"],
+        "open_keys": live["watermark"]["open_keys"],
+        "events": live["counters"]["events"],
+    }
+    payloads = segments.sample_payloads()
+    samples_sources = []
+    for item in settings.TABLES:
+        source = item["name"]
+        buttons = []
+        for key, label in (("1", "seg1"), ("2", "seg2"), ("3", "seg3"),
+                           ("4", "seg4"), ("4bad", "seg4（坏）")):
+            if key in payloads.get(source, {}):
+                buttons.append((key, 4 if key == "4bad" else int(key), label, "secondary"))
+        samples_sources.append((source, buttons))
+    return render(
+        request,
+        "segments.html",
+        page="segments",
+        nav="segments",
+        notice=notice,
+        error=error,
+        board=board,
+        pub=pub,
+        live_wm=live_wm,
+        samples_json=json.dumps(payloads, ensure_ascii=False),
+        samples_sources=samples_sources,
+        segment_status_labels=settings.SEGMENT_STATUS_LABELS,
+        demo_hints=settings.SEGMENT_DEMO_HINTS,
+    )
+
+
+# --- 补传与发布：表单端点（303 回页面） ---------------------------------------
+
+
+@app.post("/segments/upload", include_in_schema=False)
+async def segment_upload_form(request: Request):
+    form = await request.form()
+    source = str(form.get("source", "")).strip()
+    try:
+        segment_no = int(str(form.get("segment_no", "")).strip())
+    except ValueError:
+        return back_to_segments(error="段号必须是整数")
+    if source not in settings.TABLE_NAMES:
+        return back_to_segments(error=f"未知的来源：{source}；可选 {', '.join(settings.TABLE_NAMES)}")
+    if segment_no < 1:
+        return back_to_segments(error="段号必须是 >=1 的整数")
+    text = str(form.get("events_jsonl", ""))
+    conn = with_conn()
+    try:
+        raw_events = segments.parse_jsonl_text(conn, text, source, segment_no)
+        result = segments.ingest(conn, source, segment_no, raw_events)
+        return back_to_segments(notice=result["message"])
+    except segments.SegmentInvalid as exc:
+        return back_to_segments(error=f"{source} seg{segment_no} 整段停住：{exc}")
+    except segments.SegmentConflict as exc:
+        return back_to_segments(error=str(exc))
+    except segments.SegmentError as exc:
+        return back_to_segments(error=str(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/segments/publish", include_in_schema=False)
+async def segment_publish_form(request: Request):
+    form = await request.form()
+    tables = [str(t) for t in form.getlist("tables")]
+    try:
+        schema_version = int(str(form.get("schema_version", "1")).strip())
+    except ValueError:
+        return back_to_segments(error="schema 版本非法")
+    conn = with_conn()
+    try:
+        result = publish.publish(conn, tables, schema_version)
+    except publish.PublishError as exc:
+        current = store.current_publish(conn)
+        kept = f"；现网保留发布 #{current['publish_no']}" if current else "；现网仍未发布"
+        return back_to_segments(error="校验未通过：" + "；".join(exc.reasons) + kept)
+    except runner.RunError as exc:
+        return back_to_segments(error=str(exc))
+    finally:
+        conn.close()
+    return back_to_segments(notice=result["message"])
+
+
+@app.post("/segments/reset", include_in_schema=False)
+def segment_reset_form():
+    conn = with_conn()
+    try:
+        stats = segments.reset(conn)
+    finally:
+        conn.close()
+    return back_to_segments(
+        notice=f"已重置补传与发布：清理段事件 {stats['deleted_events']} 条、"
+               f"段记录 {stats['deleted_segments']} 个、发布 {stats['deleted_publishes']} 次"
+               "（基础样例与历史运行保留）"
+    )
+
+
 # --- API -------------------------------------------------------------------
 
 
@@ -366,3 +503,122 @@ def api_schema(version: int):
     if version not in (1, 2):
         raise HTTPException(status_code=400, detail="schema 版本只支持 1 或 2")
     return schema_gate.load_schema(settings.SCHEMAS_DIR / f"v{version}.json")
+
+
+# --- 分段补传（模块 7） -------------------------------------------------------
+
+
+@app.post("/api/segments")
+def api_segment_ingest(payload: SegmentUpload):
+    """补传一个段：连续段号核对 → 确认（含级联）/ 隔离 / 整段停住 / 幂等重试。"""
+    if payload.source not in settings.TABLE_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知的来源：{payload.source}；可选 {', '.join(settings.TABLE_NAMES)}",
+        )
+    conn = with_conn()
+    try:
+        raw_events = payload.events
+        if raw_events is None:
+            if not payload.events_jsonl:
+                raise HTTPException(status_code=400, detail="events 与 events_jsonl 至少给一个")
+            raw_events = segments.parse_jsonl_text(
+                conn, payload.events_jsonl, payload.source, payload.segment_no
+            )
+        result = segments.ingest(conn, payload.source, payload.segment_no, raw_events)
+    except segments.SegmentInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except segments.SegmentConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except segments.SegmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return result
+
+
+@app.get("/api/segments")
+def api_segments_board():
+    """段状态看板：各来源已确认前缀 / 下一期望段 / 缺口 / 隔离段 / 失败段。"""
+    conn = with_conn()
+    try:
+        return segments.board(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/segments/reset")
+def api_segments_reset():
+    """演示重置：清空段与发布状态（基础样例与历史运行保留）。"""
+    conn = with_conn()
+    try:
+        return segments.reset(conn)
+    finally:
+        conn.close()
+
+
+@app.get("/api/segments/samples")
+def api_segment_samples():
+    """样例段内容（与页面快捷按钮同源），便于 curl 演示。"""
+    out: dict[str, dict[str, list]] = {}
+    for source, segs in segments.sample_payloads().items():
+        out[source] = {
+            key: [json.loads(line) for line in text.splitlines() if line.strip()]
+            for key, text in segs.items()
+        }
+    return out
+
+
+# --- 原子发布（模块 8） -------------------------------------------------------
+
+
+@app.post("/api/publish")
+def api_publish(payload: PublishRequest):
+    """校验全部选中表 → 通过则一次切换现网并导出；失败保留旧版（409）。"""
+    conn = with_conn()
+    try:
+        result = publish.publish(conn, payload.tables, payload.schema_version)
+    except publish.PublishError as exc:
+        current = store.current_publish(conn)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reasons": exc.reasons,
+                "kept_publish_no": current["publish_no"] if current else None,
+            },
+        ) from exc
+    except runner.RunError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return result
+
+
+@app.get("/api/publishes")
+def api_publishes():
+    """发布状态：现网当前版 / 上一版 / 切换前后对照 / 历史与尝试日志。"""
+    conn = with_conn()
+    try:
+        return publish.status(conn)
+    finally:
+        conn.close()
+
+
+@app.get("/api/publishes/{publish_no}/export")
+def api_publish_export(publish_no: int):
+    """下载某次发布随切换一并导出的快照 JSON。"""
+    conn = with_conn()
+    try:
+        found = publish.get_export(conn, publish_no)
+    finally:
+        conn.close()
+    if found is None:
+        raise HTTPException(status_code=404, detail=f"发布不存在：#{publish_no}")
+    pub, snapshot_json = found
+    return Response(
+        content=snapshot_json,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="cdcwater-publish-{publish_no}.json"'
+        },
+    )

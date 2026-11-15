@@ -22,6 +22,7 @@
       <a href="/" class="{% if page == 'index' %}active{% endif %}"><span class="ico">总</span><span>总览</span></a>
       <a href="/workbench" class="{% if page in ('workbench', 'result') %}active{% endif %}"><span class="ico">台</span><span>事件工作台</span></a>
       <a href="/review" class="{% if page == 'review' %}active{% endif %}"><span class="ico">核</span><span>复核与导出</span>{% if run_count %}<span class="badge">{{ run_count }}</span>{% endif %}</a>
+      <a href="/segments" class="{% if page == 'segments' %}active{% endif %}"><span class="ico">传</span><span>补传与发布</span></a>
 
       <div class="side-group">业务模块</div>
       <a href="/workbench#m1"><span class="ico">1</span><span>事件归档</span></a>
@@ -30,6 +31,8 @@
       <a href="/workbench#m4"><span class="ico">4</span><span>乱序/水位</span></a>
       <a href="/workbench#m5"><span class="ico">5</span><span>schema 门禁</span></a>
       <a href="/workbench#m6"><span class="ico">6</span><span>快照导出</span></a>
+      <a href="/segments#m7"><span class="ico">7</span><span>分段补传</span></a>
+      <a href="/segments#m8"><span class="ico">8</span><span>原子发布</span></a>
     </nav>
     <div class="side-foot">样例 3 表 · 180 条事件<br>SQLite 命名卷 · 离线可跑</div>
   </aside>
